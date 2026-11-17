@@ -1,0 +1,80 @@
+# Teevra incident and response API
+
+Python 3.11+, FastAPI and SQLite back the reporter and responder dashboards. Ollama runs Llama 3.2 for chat and report assessment and Moondream for image descriptions.
+
+## Setup
+
+From the repository root:
+
+```sh
+python3 -m venv Backend/.venv
+Backend/.venv/bin/python -m pip install -r Backend/requirements.txt
+```
+
+Install and start Ollama, then run `ollama pull llama3.2` and `ollama pull moondream`. The following optional `Backend/.env` settings show the defaults:
+
+```dotenv
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.2
+OLLAMA_VISION_MODEL=moondream
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+```
+
+When Ollama is unavailable, reports use a labelled rules assessment requiring operator review; chat reports an error and report summaries can be entered manually. Voice uses local Whisper and Piper. Install backend requirements and run `Backend/.venv/bin/python Backend/download_voices.py` to install the Hindi and Indian English voices. The Hindi voice dataset is CC BY-NC-SA 4.0 and the English model is AGPL-3.0; check their terms before deployment.
+
+```sh
+Backend/.venv/bin/python -m uvicorn Backend.main:app --reload --reload-dir Backend --reload-exclude '**/.venv/**' --host 127.0.0.1 --port 8000
+```
+
+Then run `npm run dev` in another terminal. Open `/` for reporters and `/responder` for dispatch. Vite proxies `/api` and `/uploads`. API documentation is at `http://127.0.0.1:8000/docs`.
+
+## Incident operations
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /api/incidents` | Immediately create a uniquely identified report with a rules-based initial assessment; refine it with AI in the background. |
+| `GET /api/incidents` | List incidents in priority/severity/age order; supports status, priority, category and search filters. |
+| `GET /api/incidents/{id}` | Read saved incident, assessment, updates, attachments, fleet assignments and status. |
+| `POST /api/incidents/{id}/updates` | Persist new text/media and optional updated incident coordinates, then assess the full timestamped history. |
+| `POST /api/incidents/{id}/triage` | Reassess the incident with all situation updates and media. |
+| `GET /api/incidents/{id}/map` | Assigned fleet coordinates and road routes to the incident; optional available-fleet previews. |
+| `GET /api/incidents/{id}/recommendations` | Suggest every relevant department and its available fleets, ordered by estimated arrival and distance. |
+| `POST /api/incidents/{id}/dispatch` | Assign an available fleet. Multiple units/departments may serve one incident. |
+| `PATCH /api/incidents/{id}/status` | Advance assigned → en route → on scene → resolved, or cancel. Release all assigned fleets on closure. |
+| `GET /api/responders` | Read fleet readiness and stored coordinates. |
+| `PATCH /api/responders/{id}/location` | Supply `lat`, `lng` and `current_location`; mark coordinates as telemetry with a server timestamp. |
+| `PATCH /api/responders/{id}/status?status=Available` | Change unassigned fleet readiness to Available or Off Duty. |
+| `GET /api/department/stats` | Active incidents, priority counts and fleet availability. |
+| `POST /api/upload` | Upload image/audio files up to 20 MB each; return a durable `/uploads/...` reference. |
+| `POST /api/chat` | Generate guidance from bounded user/assistant message history. |
+| `POST /api/chat/transcribe` | Transcribe a bounded WAV recording with Gemini. |
+| `POST /api/chat/speech` | Generate WAV speech from bounded text with Gemini. |
+| `GET /api/health` | Process/configuration and department status; not a provider connectivity check. |
+
+## Evaluation and updates
+
+The latest three conversation images are described by local Moondream and their unverified descriptions are supplied to Llama. Successful descriptions are cached in memory to avoid repeating image inference on every turn. If image inference fails, Llama is told the image is unavailable. Llama's triage assessment is text-only and flags attachments for operator review; original uploads remain accessible to the responder. External attachment URLs are not fetched by the model bridge.
+
+Updates are stored before inference and serialize per incident within the API process, so a later update cannot be overwritten by an earlier assessment. Reassessment includes the original report and every timestamped update. The response indicates when a newer update is awaiting assessment. Fresh assessments replace the previous score and priority. Explicit reported improvement can lower the fallback score, with operator review required; escalation updates priority, classification, queue order and department recommendations. Provider failure uses a labelled rules fallback with zero model confidence rather than claiming an AI result.
+
+The queue score uses priority bands (P1=200, P2=100, P3=0), severity × 0.7, and capped waiting time × 0.25 (maximum 120 minutes), followed by original report time. Fleet ETAs prefer road driving duration from OSRM. An explicitly labelled routing fallback uses stored coordinates, a 1.3 distance multiplier, 30 km/h and two minutes of mobilisation. Neither includes live traffic; demo coordinates are labelled and unknown coordinates produce no ETA.
+
+SQLite additive migrations preserve existing records, reconcile legacy dispatches with fleet readiness, and store continuing updates and multiple assignments. Runtime files are `Backend/teevra.db` and the repository's `uploads/` directory; both are ignored by Git. The existing demo data is retained.
+
+## Tests
+
+```sh
+Backend/.venv/bin/python -m unittest discover -s Backend/tests -v
+```
+
+Tests use isolated temporary databases and mock inference; they do not consume provider credits. The frontend checks are `npm run lint` and `npm run build`.
+
+## Integration boundaries
+
+This remains a prototype. UI separation does not enforce role authorization. Before public use, integrate authentication and incident ownership checks, responder roles, authenticated fleet telemetry and real dispatch services. Multi-worker deployment needs cross-process coordination for serial assessment. Serve frontend deep links through an SPA fallback and proxy `/api` and `/uploads` in production. GPS and microphone permission require a secure browser context. Mobile numbers are entered by the reporter because web browsers cannot read the device's phone number.
+
+## Road routing and map tracking
+
+`GET /api/incidents/{id}/map` returns assigned fleet GPS positions and actual OSRM road geometry, distance and driving duration from each fleet to the incident. `unit_ids` can include available fleets for assignment previews. GPS updates through `PATCH /api/responders/{id}/location` change route cache keys, so both dashboards receive new routes and ETAs. Fleet recommendations prefer road duration/distance and label the approximate fallback when routing is unavailable.
+
+Configure `ROUTING_BASE_URL` (default `https://router.project-osrm.org`) for a compatible OSRM server. Set it to an empty string to disable external road routing. The bridge uses the [OSRM route service](https://project-osrm.org/docs/v5.24.0/api/#route-service), with longitude/latitude order from fleet to reported incident. Each request has a four-second timeout; routes cache by coordinates for five minutes, failures for 30 seconds. Road estimates exclude live traffic and mobilisation delays. A failed route never generates a straight-line road polyline. Public services have no emergency availability guarantee; use a suitable deployment for production.
